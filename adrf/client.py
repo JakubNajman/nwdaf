@@ -115,11 +115,11 @@ class ADRFClient:
             }
         return result
     
-    def get_general_anomaly(self, window_minutes: int = 15) -> dict:
+    def get_general_anomaly(self, window_minutes: int = 15, lag_minutes: int = 5) -> dict:
         window_step = window_minutes//3
-        t_start_oldest = window_minutes
-        t_start_middle = window_minutes - window_step
-        t_start_latest = window_step
+        t_start_oldest = window_minutes + lag_minutes
+        t_start_middle = (window_minutes - window_step) + lag_minutes
+        t_start_latest = window_step + lag_minutes
         resp = self._es.search(
             index=ES_INDEX,
             body={
