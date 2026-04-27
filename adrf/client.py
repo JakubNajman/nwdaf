@@ -127,7 +127,7 @@ class ADRFClient:
             "query": {
                 "bool": {
                     "must": [
-                        {"range": {"@timestamp": {"gte": f"now-{window_minutes}m"}}},
+                        {"range": {"@timestamp": {"gte": f"now-{t_start_oldest}m"}}},
                         {"term":  {"flow.final": True}}
                     ]
                 }
