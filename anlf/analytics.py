@@ -9,8 +9,12 @@ from shared.models import Snssai, AnalyticsRequest
 from adrf.client import adrf
 
 
+EXC_LONG_LIVE_LARGE_RATE = "UNEXPECTED_LONG_LIVE_LARGE_RATE_FLOWS"
+EXC_DDOS                 = "SUSPICION_OF_DDOS_ATTACK"
+
+
 class AnLF:
-    
+
     def compute_abnormal_behaviour_general(self, req: AnalyticsRequest) -> dict:
         snssai = req.snssaiDnnFilter.snssai if req.snssaiDnnFilter else Snssai()
 
@@ -29,25 +33,29 @@ class AnLF:
         byte_ratio = last_bytes / prev_bytes
         flow_ratio = last_flows / prev_flows
 
-        abnormal, cause = model_result["is_anomaly"], None
+        abnormal, cause, cause_kind = model_result["is_anomaly"], None, None
 
         if abnormal:
             if byte_ratio > ANOMALY_SPIKE_RATIO:
-                cause = f"MODEL_FLAGGED + TRAFFIC_SPIKE: {byte_ratio:.1f}x increase in bytes"
+                cause      = f"MODEL_FLAGGED + TRAFFIC_SPIKE: {byte_ratio:.1f}x increase in bytes"
+                cause_kind = "TRAFFIC_SPIKE"
             elif byte_ratio < (1 / ANOMALY_SPIKE_RATIO) and prev_bytes > 10_000:
-                cause = f"MODEL_FLAGGED + TRAFFIC_DROP: {byte_ratio:.2f}x decrease in bytes"
+                cause      = f"MODEL_FLAGGED + TRAFFIC_DROP: {byte_ratio:.2f}x decrease in bytes"
+                cause_kind = "TRAFFIC_DROP"
             elif flow_ratio > ANOMALY_SPIKE_RATIO * 1.5:
-                cause = f"MODEL_FLAGGED + FLOW_SPIKE: {flow_ratio:.1f}x increase in flows"
+                cause      = f"MODEL_FLAGGED + FLOW_SPIKE: {flow_ratio:.1f}x increase in flows"
+                cause_kind = "FLOW_SPIKE"
             else:
-                cause = "MODEL_FLAGGED: multivariate anomaly (unusual feature combination)"
+                cause      = "MODEL_FLAGGED: multivariate anomaly (unusual feature combination)"
+                cause_kind = "MODEL_ONLY"
         elif not model_result["reachable"]:
             if byte_ratio > ANOMALY_SPIKE_RATIO:
-                abnormal, cause = True, f"FALLBACK_TRAFFIC_SPIKE: {byte_ratio:.1f}x increase"
+                abnormal, cause, cause_kind = True, f"FALLBACK_TRAFFIC_SPIKE: {byte_ratio:.1f}x increase", "TRAFFIC_SPIKE"
             elif byte_ratio < (1 / ANOMALY_SPIKE_RATIO) and prev_bytes > 10_000:
-                abnormal, cause = True, f"FALLBACK_TRAFFIC_DROP: {byte_ratio:.2f}x decrease"
+                abnormal, cause, cause_kind = True, f"FALLBACK_TRAFFIC_DROP: {byte_ratio:.2f}x decrease", "TRAFFIC_DROP"
             elif flow_ratio > ANOMALY_SPIKE_RATIO * 1.5:
-                abnormal, cause = True, f"FALLBACK_FLOW_SPIKE: {flow_ratio:.1f}x increase"
-        
+                abnormal, cause, cause_kind = True, f"FALLBACK_FLOW_SPIKE: {flow_ratio:.1f}x increase", "FLOW_SPIKE"
+
         confidence = 0
 
         if abnormal and model_result["reachable"]:
@@ -63,13 +71,21 @@ class AnLF:
             prediction_pretty = "NORMAL"
         else: prediction_pretty = "ABNORMAL"
 
+        exceptions = []
+        if abnormal:
+            exceptions.append(self._build_exception(
+                cause_kind, byte_ratio, flow_ratio, last_bytes, last_flows, confidence
+            ))
+
         return {
             "analyticsId":       "ABNORMAL_BEHAVIOUR",
             "snssai":            snssai.model_dump(),
+            "timeStamp":         datetime.utcnow().isoformat() + "Z",
+            "validityPeriod":    f"PT{DEFAULT_WINDOW_MIN}M",
+            "exceptions":        exceptions,
             "abnormalBehaviour": abnormal,
             "cause":             cause,
             "confidence":        confidence,
-            "timeStamp":         datetime.utcnow().isoformat() + "Z",
             "extraData": {
                 "model": {
                     "reachable":     model_result["reachable"],
@@ -89,7 +105,50 @@ class AnLF:
                 }
             }
         }
-    
+
+    def _build_exception(self, cause_kind: str, byte_ratio: float, flow_ratio: float,
+                         last_bytes: int, last_flows: int, confidence: int) -> dict:
+        exception_id = {
+            "TRAFFIC_SPIKE": EXC_LONG_LIVE_LARGE_RATE,
+            "TRAFFIC_DROP":  EXC_LONG_LIVE_LARGE_RATE,
+            "FLOW_SPIKE":    EXC_DDOS,
+            "MODEL_ONLY":    EXC_LONG_LIVE_LARGE_RATE,
+        }.get(cause_kind, EXC_LONG_LIVE_LARGE_RATE)
+
+        if cause_kind == "FLOW_SPIKE":
+            exception_level = int(min(100, max(1, flow_ratio * 10)))
+        elif cause_kind == "TRAFFIC_DROP":
+            exception_level = int(min(100, max(1, (1 / max(byte_ratio, 0.001)) * 5)))
+        else:
+            exception_level = int(min(100, max(1, byte_ratio * 1.5)))
+
+        if cause_kind == "TRAFFIC_DROP":
+            trend = "down"
+        elif cause_kind in ("TRAFFIC_SPIKE", "FLOW_SPIKE"):
+            trend = "up"
+        elif byte_ratio > 1.2:
+            trend = "up"
+        elif byte_ratio < 0.8:
+            trend = "down"
+        else:
+            trend = "stable"
+
+        return {
+            "exceptionId":    exception_id,
+            "exceptionLevel": exception_level,
+            "exceptionTrend": trend,
+            "ratio":          None,
+            "amount":         None,
+            "supiList":       [],
+            "additionalMeasurement": {
+                "byteRatio":   round(byte_ratio, 3),
+                "flowRatio":   round(flow_ratio, 3),
+                "latestBytes": last_bytes,
+                "latestFlows": last_flows,
+            },
+            "confidence":     confidence,
+        }
+
     def _request_anomaly(self, raw: dict) -> dict:
 
         total_bytes   = raw.get("total_bytes",   0)
